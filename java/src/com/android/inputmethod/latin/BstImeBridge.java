@@ -141,7 +141,7 @@ final class BstImeBridge {
     private void listen() {
         while (mRunning) {
             try (ServerSocket serverSocket = new ServerSocket(
-                    0, 4, InetAddress.getLoopbackAddress())) {
+                    0, 4, InetAddress.getByName("127.0.0.1"))) {
                 serverSocket.setReuseAddress(true);
                 mServerSocket = serverSocket;
                 setProperty(LISTENER_PORT_PROPERTY,
