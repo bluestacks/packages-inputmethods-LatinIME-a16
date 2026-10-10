@@ -37,6 +37,7 @@ import android.media.AudioManager;
 import android.os.Build;
 import android.os.Debug;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.os.Message;
 import android.preference.PreferenceManager;
 import android.text.InputType;
@@ -48,12 +49,16 @@ import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.KeyCharacterMap;
 import android.view.ViewGroup.LayoutParams;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.CompletionInfo;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.ExtractedTextRequest;
+import android.view.inputmethod.ExtractedText;
 import android.view.inputmethod.InputMethodSubtype;
+import android.view.inputmethod.InputConnection;
 
 import androidx.annotation.NonNull;
 
@@ -94,6 +99,7 @@ import com.android.inputmethod.latin.utils.ApplicationUtils;
 import com.android.inputmethod.latin.utils.DialogUtils;
 import com.android.inputmethod.latin.utils.ImportantNoticeUtils;
 import com.android.inputmethod.latin.utils.IntentUtils;
+import com.android.inputmethod.latin.utils.InputTypeUtils;
 import com.android.inputmethod.latin.utils.JniUtils;
 import com.android.inputmethod.latin.utils.LeakGuardHandlerWrapper;
 import com.android.inputmethod.latin.utils.StatsUtils;
@@ -101,8 +107,16 @@ import com.android.inputmethod.latin.utils.StatsUtilsManager;
 import com.android.inputmethod.latin.utils.SubtypeLocaleUtils;
 import com.android.inputmethod.latin.utils.ViewLayoutUtils;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -110,6 +124,9 @@ import java.util.concurrent.TimeUnit;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+
+import com.bluestacks.os.BstFilterAppsManager;
+import com.bluestacks.os.BstUtilsManager;
 
 /**
  * Input method implementation for Qwerty'ish keyboard.
@@ -120,6 +137,9 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         PermissionsManager.PermissionsResultCallback {
     static final String TAG = LatinIME.class.getSimpleName();
     private static final boolean TRACE = false;
+    private static boolean DEBUG = false;
+    private boolean BST_DEBUG = TRACE || android.os.SystemProperties.getInt("bst.debug.bstime",0) > 0 ? true : false;
+    private static long bstPreviousDelEnterEventTime = 0;
 
     private static final int PERIOD_FOR_AUDIO_AND_HAPTIC_FEEDBACK_IN_KEY_REPEAT = 2;
     private static final int PENDING_IMS_CALLBACK_DURATION_MILLIS = 800;
@@ -198,13 +218,20 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     final HideSoftInputReceiver mHideSoftInputReceiver = new HideSoftInputReceiver(this);
 
     private AlertDialog mOptionsDialog;
+    private String previousPackageName = null;
+    private String currentPackageName = null;
+    private String softKeyboardModifier = "soft";
+    boolean isSoftKeyboardRequired = false;
 
+    private final RichInputConnection mConnection = new RichInputConnection(this);
     private final boolean mIsHardwareAcceleratedDrawingEnabled;
 
     private GestureConsumer mGestureConsumer = GestureConsumer.NULL_GESTURE_CONSUMER;
 
     public final UIHandler mHandler = new UIHandler(this);
     private BstImeBridge mBstImeBridge;
+    // BS-A16 mac port: host soft-IME injection path (BST_UTILS service)
+    private BstUtilsManager mBstUtils;
 
     public static final class UIHandler extends LeakGuardHandlerWrapper<LatinIME> {
         private static final int MSG_UPDATE_SHIFT_STATE = 0;
@@ -611,9 +638,11 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         mBstImeBridge.start();
 
         mHandler.onCreate();
-
+        DEBUG = DebugFlags.DEBUG_ENABLED;
+        BST_DEBUG |= DEBUG;
         // TODO: Resolve mutual dependencies of {@link #loadSettings()} and
         // {@link #resetDictionaryFacilitatorIfNecessary()}.
+        mBstUtils = (BstUtilsManager) getApplicationContext().getSystemService(Context.BST_UTILS);
         loadSettings();
         resetDictionaryFacilitatorIfNecessary();
 
@@ -621,6 +650,12 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         final IntentFilter filter = new IntentFilter();
         filter.addAction(AudioManager.RINGER_MODE_CHANGED_ACTION);
         registerReceiver(mRingerModeChangeReceiver, filter);
+
+        //A thread to start the server that keeps on listening for any incoming ime data
+        //that is to be sent and displayed.
+        IMESocketConnectionListener mSocketConnectionListener = new IMESocketConnectionListener();
+        Thread ImeSocketListenerThread = new Thread(mSocketConnectionListener);
+        ImeSocketListenerThread.start();
 
         // Register to receive installation and removal of a dictionary pack.
         final IntentFilter packageFilter = new IntentFilter();
@@ -763,6 +798,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             mBstImeBridge.stop();
         }
         mDictionaryFacilitator.closeDictionaries();
+        mBstUtils.setProperty("bst.config.ime_listenerport", "0");
         mSettings.onDestroy();
         unregisterReceiver(mHideSoftInputReceiver);
         unregisterReceiver(mRingerModeChangeReceiver);
@@ -1788,6 +1824,19 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         return newDecoder;
     }
 
+    // Utility function to check is hardkeyboard Enabled
+    private boolean isHardkeyboardEnabled()
+    {
+        boolean hardkeyboardIsEnabled = true;
+        BstUtilsManager bstUtils = (BstUtilsManager) getApplicationContext().getSystemService(Context.BST_UTILS);
+        boolean isShowImeWithHardKeyboardEnabled = bstUtils.isBstSoftKeyboardEnabled();
+
+        if (isShowImeWithHardKeyboardEnabled) {
+            hardkeyboardIsEnabled = false;
+        }
+        return hardkeyboardIsEnabled;
+    }
+
     // Hooks for hardware keyboard
     @Override
     public boolean onKeyDown(final int keyCode, final KeyEvent keyEvent) {
@@ -1802,19 +1851,48 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         if (!ProductionFlags.IS_HARDWARE_KEYBOARD_SUPPORTED) {
             return super.onKeyDown(keyCode, keyEvent);
         }
-        final Event event = getHardwareKeyEventDecoder(
-                keyEvent.getDeviceId()).decodeHardwareKey(keyEvent);
-        // If the event is not handled by LatinIME, we just pass it to the parent implementation.
-        // If it's handled, we return true because we did handle it.
-        if (event.isHandled()) {
-            mInputLogic.onCodeInput(mSettings.getCurrent(), event,
-                    mKeyboardSwitcher.getKeyboardShiftMode(),
-                    // TODO: this is not necessarily correct for a hardware keyboard right now
-                    mKeyboardSwitcher.getCurrentKeyboardScriptId(),
-                    mHandler);
-            return true;
+    }
+
+    private void performEditorAction(final int actionId) {
+        mConnection.performEditorAction(actionId);
+    }
+
+    // this function was added for HearthStone (com.blizzard.wtcg.hearthstone) for
+    // Bug 2346.Same behaviour now if you press enter on softkeyboard or hardkeyboard.
+    // This handling of the ENTER key is similar to how it is handled in the case of softkeyboard.
+    // For reference see code in file InputLogic.java function handleNonFunctionalEvent
+    private boolean bstPerformEditorActionForHardKeyBoardHooks()
+    {
+        boolean eventHandled = false;
+        try {
+            final EditorInfo editorInfo = getCurrentInputEditorInfo();
+            if (editorInfo != null ) {
+                final int imeOptionsActionId =
+                    InputTypeUtils.getImeOptionsActionIdFromEditorInfo(editorInfo);
+
+                if (InputTypeUtils.IME_ACTION_CUSTOM_LABEL == imeOptionsActionId) {
+                    // Either we have an actionLabel and we should performEditorAction with actionId
+                    // regardless of its value.
+                    performEditorAction(editorInfo.actionId);
+                    eventHandled = true;
+                }
+                else if (EditorInfo.IME_ACTION_NONE != imeOptionsActionId) {
+                    // We didn't have an actionLabel, but we had another action to execute.
+                    // EditorInfo.IME_ACTION_NONE explicitly means no action. In contrast,
+                    // EditorInfo.IME_ACTION_UNSPECIFIED is the default value for an action, so it
+                    // means there should be an action and the app didn't bother to set a specific
+                    // code for it - presumably it only handles one. It does not have to be treated
+                    // in any specific way: anything that is not IME_ACTION_NONE should be sent to
+                    // performEditorAction.
+                    performEditorAction(imeOptionsActionId);
+                    eventHandled = true;
+                }
+            }
+        } catch (Exception e) {
+            Log.d(TAG,"Exception in bstPerformEditorActionForHardKeyBoardHooks");
+            e.printStackTrace();
         }
-        return super.onKeyDown(keyCode, keyEvent);
+        return eventHandled;
     }
 
     @Override
@@ -1881,6 +1959,136 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         intent.putExtra(SettingsActivity.EXTRA_SHOW_HOME_AS_UP, false);
         intent.putExtra(SettingsActivity.EXTRA_ENTRY_KEY, extraEntryValue);
         startActivityOnTheSameDisplay(intent);
+    }
+
+    // receive imestring from BstCommandProcessor--sent from windows
+    //
+    /* valid data formats are s_<string>_e dl=<0/1> en=<0/1> cp=<0/1>
+     * if <string> is empty and dl=0 then it will not do anything -- this type will not reach here,not forwarded by BstcommandProcessor
+     * imestring s_n_e dl=0 en=0 cp=0   insert character 'n'
+     * imestring s_n_e dl=r en=0 cp=0   deletes r characters and insert character 'n'
+     * imestring s__e dl=r en=0 cp=0    deletes previous r characters
+     * imestring s__e dl=0 en=1 cp=0   send the UP-DOWN keyevents for KEY_ENTER
+     * imestring s__e dl=0 en=0 cp=0   invalid data values
+     *
+     * return values:
+     * 0 - if inputString inserted successfully to the inputTextView.
+     * < 0 - if inputString not inserted into the inputTextView.
+     * @hide
+     * */
+    public int processImeData(String imeString) {
+        if (BST_DEBUG) Log.d(TAG,"data received in latin ime is " + imeString);
+        boolean hardkeyboardIsEnabled = isHardkeyboardEnabled();
+        int ifDel = 0;
+        int ifEnter = 0;
+        boolean isComposing = false;
+        String inputString = null;
+        String beginMark = "s_";
+        String delKey = "dl=";
+        String enterKey = "en=";
+        String composingKey = "cp=";
+        int lastIndexOfDeleteKey = imeString.lastIndexOf(delKey);
+        int lastIndexOfEnterKey = imeString.lastIndexOf(enterKey);
+        int lastIndexOfComposingKey = imeString.lastIndexOf(composingKey);
+        InputConnection mBstInputConnection = getCurrentInputConnection();
+
+        try {
+            inputString = imeString.substring(imeString.indexOf(beginMark) + beginMark.length(), imeString.lastIndexOf("_e"));
+            if (lastIndexOfDeleteKey != -1) {
+                int endIndex = lastIndexOfEnterKey >= 0 ? lastIndexOfEnterKey : imeString.trim().length();
+                String delVal = imeString.substring(lastIndexOfDeleteKey + delKey.length(), endIndex);
+                ifDel = Integer.parseInt(delVal.trim());
+                if (BST_DEBUG) Log.d(TAG, "delVal = " + delVal + ", ifDel = " + ifDel);
+            }
+
+            if (lastIndexOfEnterKey != -1) {
+                int endIndex = lastIndexOfComposingKey >= 0 ? lastIndexOfComposingKey : imeString.trim().length();
+                String enterVal = imeString.substring(lastIndexOfEnterKey + enterKey.length(), endIndex);
+                ifEnter = Integer.parseInt(enterVal.trim());
+                if (BST_DEBUG) Log.d(TAG, "enterVal = " + enterVal + ", ifEnter = " + ifEnter);
+            }
+
+            if (lastIndexOfComposingKey != -1) {
+                String composingVal = imeString.substring(lastIndexOfComposingKey + composingKey.length(), imeString.trim().length());
+                isComposing = Integer.parseInt(composingVal.trim()) > 0 ? true : false;
+                android.os.SystemProperties.set("bst.ime_is_composing", isComposing?"1":"0");
+                if (BST_DEBUG) Log.d(TAG, "isComposing = " + isComposing);
+            }
+
+            if (mBstInputConnection == null) {
+                Log.e(TAG, "mBstInputConnection is null so returning...");
+                return -1;
+            }
+
+            if (ifDel >= 1) {
+                ExtractedText extractedText = mBstInputConnection.getExtractedText(new ExtractedTextRequest(), 0);
+                if (extractedText != null && inputString != null && inputString.length() > 0) {
+                    //It will delete the text surrounding the cursor ifDel chars before cursor and 0 chars after cursor.
+                    boolean success = mBstInputConnection.deleteSurroundingText(ifDel, 0);
+                    if (BST_DEBUG) Log.d(TAG, "Deleted Surrounding text : " + success);
+                } else {
+                    if (BST_DEBUG) Log.d(TAG, "Send delete key event");
+                    // Case 9099 , com.cjenm.sknights ime not working in chat room
+                    // if extracted text is null, we can't change the cursor position, so pressing
+                    // delete key
+                    while (ifDel >= 1) {
+                        int keyCode = KeyEvent.KEYCODE_DEL;
+                        final long eventTime = SystemClock.uptimeMillis();
+                        mBstInputConnection.sendKeyEvent(new KeyEvent(eventTime, eventTime,
+                                    KeyEvent.ACTION_DOWN, keyCode, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                                    KeyEvent.FLAG_SOFT_KEYBOARD | KeyEvent.FLAG_KEEP_TOUCH_MODE));
+                        mBstInputConnection.sendKeyEvent(new KeyEvent(SystemClock.uptimeMillis(), eventTime,
+                                    KeyEvent.ACTION_UP, keyCode, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                                    KeyEvent.FLAG_SOFT_KEYBOARD | KeyEvent.FLAG_KEEP_TOUCH_MODE));
+                        ifDel = ifDel - 1;
+                    }
+                    if (inputString == null || inputString.length() <= 0) {
+                        bstPreviousDelEnterEventTime = SystemClock.uptimeMillis();
+                    }
+                }
+            }
+
+            // Commit the text if inputString is non null.
+            if (inputString != null && inputString.length() > 0) {
+                if (SystemClock.uptimeMillis() - bstPreviousDelEnterEventTime < 50) {
+                    // Adding a delay to prevent race condition
+                    // between the injected DELETE key events and text committed.
+                    try {
+                        if (BST_DEBUG) Log.d(TAG, "Adding sleep for 50ms");
+                        Thread.sleep(50);
+                    } catch (Exception ex) {
+                        Log.e(TAG, "Exception: " + ex.getMessage());
+                        ex.printStackTrace();
+                    }
+                }
+
+                if (isComposing)
+                    mBstInputConnection.setComposingText(inputString, 1);
+                else
+                    mBstInputConnection.commitText(inputString, 1);
+            }
+
+            // Case BS4-7248: [INTER] [KR IME] The last character gets
+            // typed but is not sent in the output after entering.
+            // Now receiving the KEY_ENTER event at the same channel
+            // to ensure serialization
+            if (ifEnter > 0) {
+                if (BST_DEBUG) Log.d(TAG, "Sending enter key events");
+                int keyCode = KeyEvent.KEYCODE_ENTER;
+                boolean eventHandled = false;
+                final long eventTime = SystemClock.uptimeMillis();
+                eventHandled = bstPerformEditorActionForHardKeyBoardHooks();
+                if (!eventHandled) {
+                    mBstInputConnection.sendKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, keyCode));
+                    mBstInputConnection.sendKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, keyCode));
+                    bstPreviousDelEnterEventTime = SystemClock.uptimeMillis();
+                }
+            }
+        } catch (Exception ex) {
+            Log.e(TAG, "Exception while processing imeData");
+            ex.printStackTrace();
+        }
+        return 0;
     }
 
     private void showSubtypeSelectorAndSettings() {
@@ -2037,6 +2245,108 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             // transparent.  For other colors the system uses the default color.
             getWindow().getWindow().setNavigationBarColor(
                     visible ? Color.BLACK : Color.TRANSPARENT);
+        }
+    }
+    //This thread will listen for incoming data on the inputStream.
+    private class IMEDataHandler extends Thread {
+        private Socket mySocket;
+        private BufferedReader imeReader;
+        private PrintWriter imeWriter;
+
+        public IMEDataHandler (Socket s) {
+            mySocket = s;
+            Thread t = new Thread(this);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        public void run() {
+            try {
+                imeReader = new BufferedReader (
+                        new InputStreamReader (
+                            mySocket.getInputStream()));
+                imeWriter = new PrintWriter (
+                        new BufferedWriter (
+                            new OutputStreamWriter (
+                                mySocket.getOutputStream())), true);
+
+                while (true) {
+                    String imeString = imeReader.readLine();
+                    if (imeString != null) {
+                        //send the data that is to be displayed.
+                        int retVal = processImeData(imeString);
+                        //Send response to ok. The response will tell BstCommandProcessor that the server is running.
+                        if (retVal == 0)
+                            imeWriter.println("ok");
+                        else {
+                            break;
+                        }
+                    } else {
+                        //When BstCommandProcessor crashes the connection from the other side will be
+                        //broken so imeString will read null. We will exit from this loop in that case.
+                        break;
+                    }
+                }
+            } catch (Exception ex) {
+                Log.e(TAG, "Exception in IMEDataHandler : " + ex.getMessage());
+                if (BST_DEBUG) ex.printStackTrace();
+            } finally {
+                Log.w(TAG, "Closing IMEDataHandler thread");
+                try {
+                    if (imeWriter != null)
+                        imeWriter.close();
+                    if (imeReader != null)
+                        imeReader.close();
+                    if (mySocket != null)
+                        mySocket.close();
+                } catch (Exception ex) {
+                    Log.e(TAG, "Exception in IMEDataHandler : " +  ex.getMessage());
+                    if (BST_DEBUG) ex.getStackTrace();
+                }
+            }
+        }
+    }
+
+    //This thread will listen for any socket connections made with the server socket.
+    private class IMESocketConnectionListener implements Runnable {
+        public void run() {
+            Socket imeSocket = null;
+            ServerSocket imeServerSocket = null;
+            Socket clientSocket = null;
+
+            //Infinite loop , it will accept connections and then assign a worker thread to read data
+            //from that socket.
+            while (true) {
+                try {
+                    if (imeServerSocket == null) {
+                        imeServerSocket = new ServerSocket(0);
+                        int imeListenerPort = imeServerSocket.getLocalPort();
+                        if (BST_DEBUG) Log.d(TAG, "The imeListenerPort is : " + imeListenerPort);
+                        mBstUtils.setProperty("bst.config.ime_listenerport", Integer.toString(imeListenerPort));
+                        //Setting reuseAddress state to true as it will allow the socket to be bound even though
+                        //a previous connection is in a timeout state.
+                        imeServerSocket.setReuseAddress(true);
+                    }
+
+                    //It listens for a connection to be made to this socket and accepts it.
+                    //The method blocks until a connection is made.
+                    clientSocket = imeServerSocket.accept();
+                    //New thread, with new socket that will handle the incoming data
+                    new IMEDataHandler(clientSocket);
+                } catch (Exception ex) {
+                    Log.e(TAG, "Exception in IMESocketConnectionListener : " + ex.getMessage());
+                    if (BST_DEBUG) ex.printStackTrace();
+                    try {
+                        if (imeServerSocket != null) {
+                            imeServerSocket.close();
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Exception in IMESocketConnectionListener : " +  e.getMessage());
+                        if (BST_DEBUG) e.getStackTrace();
+                    }
+                    imeServerSocket = null;
+                }
+            }
         }
     }
 }
