@@ -125,8 +125,6 @@ import java.util.concurrent.TimeUnit;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
-import com.bluestacks.os.BstFilterAppsManager;
-import com.bluestacks.os.BstUtilsManager;
 
 /**
  * Input method implementation for Qwerty'ish keyboard.
@@ -138,7 +136,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     static final String TAG = LatinIME.class.getSimpleName();
     private static final boolean TRACE = false;
     private static boolean DEBUG = false;
-    private boolean BST_DEBUG = TRACE || android.os.SystemProperties.getInt("bst.debug.bstime",0) > 0 ? true : false;
+    private boolean BST_DEBUG = TRACE || BstImeHooks.getInt("bst.debug.bstime", 0) > 0;
     private static long bstPreviousDelEnterEventTime = 0;
 
     private static final int PERIOD_FOR_AUDIO_AND_HAPTIC_FEEDBACK_IN_KEY_REPEAT = 2;
@@ -230,8 +228,6 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
 
     public final UIHandler mHandler = new UIHandler(this);
     private BstImeBridge mBstImeBridge;
-    // BS-A16 mac port: host soft-IME injection path (BST_UTILS service)
-    private BstUtilsManager mBstUtils;
 
     public static final class UIHandler extends LeakGuardHandlerWrapper<LatinIME> {
         private static final int MSG_UPDATE_SHIFT_STATE = 0;
@@ -642,7 +638,6 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         BST_DEBUG |= DEBUG;
         // TODO: Resolve mutual dependencies of {@link #loadSettings()} and
         // {@link #resetDictionaryFacilitatorIfNecessary()}.
-        mBstUtils = (BstUtilsManager) getApplicationContext().getSystemService(Context.BST_UTILS);
         loadSettings();
         resetDictionaryFacilitatorIfNecessary();
 
@@ -651,11 +646,13 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         filter.addAction(AudioManager.RINGER_MODE_CHANGED_ACTION);
         registerReceiver(mRingerModeChangeReceiver, filter);
 
-        //A thread to start the server that keeps on listening for any incoming ime data
-        //that is to be sent and displayed.
-        IMESocketConnectionListener mSocketConnectionListener = new IMESocketConnectionListener();
-        Thread ImeSocketListenerThread = new Thread(mSocketConnectionListener);
-        ImeSocketListenerThread.start();
+        // Mac host injects soft-IME text over a local socket. Windows reaches
+        // processImeData through BstCommandProcessor and does not open this port.
+        if (BstImeHooks.isArm64Guest()) {
+            IMESocketConnectionListener mSocketConnectionListener = new IMESocketConnectionListener();
+            Thread ImeSocketListenerThread = new Thread(mSocketConnectionListener);
+            ImeSocketListenerThread.start();
+        }
 
         // Register to receive installation and removal of a dictionary pack.
         final IntentFilter packageFilter = new IntentFilter();
@@ -798,7 +795,9 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             mBstImeBridge.stop();
         }
         mDictionaryFacilitator.closeDictionaries();
-        mBstUtils.setProperty("bst.config.ime_listenerport", "0");
+        if (BstImeHooks.isArm64Guest()) {
+            BstImeHooks.setProperty(this, "bst.config.ime_listenerport", "0");
+        }
         mSettings.onDestroy();
         unregisterReceiver(mHideSoftInputReceiver);
         unregisterReceiver(mRingerModeChangeReceiver);
@@ -1828,8 +1827,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     private boolean isHardkeyboardEnabled()
     {
         boolean hardkeyboardIsEnabled = true;
-        BstUtilsManager bstUtils = (BstUtilsManager) getApplicationContext().getSystemService(Context.BST_UTILS);
-        boolean isShowImeWithHardKeyboardEnabled = bstUtils.isBstSoftKeyboardEnabled();
+        boolean isShowImeWithHardKeyboardEnabled = BstImeHooks.isSoftKeyboardEnabled(this);
 
         if (isShowImeWithHardKeyboardEnabled) {
             hardkeyboardIsEnabled = false;
@@ -1851,6 +1849,19 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         if (!ProductionFlags.IS_HARDWARE_KEYBOARD_SUPPORTED) {
             return super.onKeyDown(keyCode, keyEvent);
         }
+        final Event event = getHardwareKeyEventDecoder(
+                keyEvent.getDeviceId()).decodeHardwareKey(keyEvent);
+        // If the event is not handled by LatinIME, we just pass it to the parent implementation.
+        // If it's handled, we return true because we did handle it.
+        if (event.isHandled()) {
+            mInputLogic.onCodeInput(mSettings.getCurrent(), event,
+                    mKeyboardSwitcher.getKeyboardShiftMode(),
+                    // TODO: this is not necessarily correct for a hardware keyboard right now
+                    mKeyboardSwitcher.getCurrentKeyboardScriptId(),
+                    mHandler);
+            return true;
+        }
+        return super.onKeyDown(keyCode, keyEvent);
     }
 
     private void performEditorAction(final int actionId) {
@@ -2011,7 +2022,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             if (lastIndexOfComposingKey != -1) {
                 String composingVal = imeString.substring(lastIndexOfComposingKey + composingKey.length(), imeString.trim().length());
                 isComposing = Integer.parseInt(composingVal.trim()) > 0 ? true : false;
-                android.os.SystemProperties.set("bst.ime_is_composing", isComposing?"1":"0");
+                BstImeHooks.set("bst.ime_is_composing", isComposing ? "1" : "0");
                 if (BST_DEBUG) Log.d(TAG, "isComposing = " + isComposing);
             }
 
@@ -2322,7 +2333,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
                         imeServerSocket = new ServerSocket(0);
                         int imeListenerPort = imeServerSocket.getLocalPort();
                         if (BST_DEBUG) Log.d(TAG, "The imeListenerPort is : " + imeListenerPort);
-                        mBstUtils.setProperty("bst.config.ime_listenerport", Integer.toString(imeListenerPort));
+                        BstImeHooks.setProperty(LatinIME.this, "bst.config.ime_listenerport", Integer.toString(imeListenerPort));
                         //Setting reuseAddress state to true as it will allow the socket to be bound even though
                         //a previous connection is in a timeout state.
                         imeServerSocket.setReuseAddress(true);
@@ -2350,3 +2361,72 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         }
     }
 }
+
+
+
+/**
+ * Mac host soft-IME uses hidden platform APIs. LatinIME is built against the
+ * public SDK, so those calls go through reflection. Fetching the bstutils
+ * service constructs BstUtilsManager and binds its static service stub.
+ */
+final class BstImeHooks {
+    private static final String TAG = "LatinIME";
+    private static final String BST_UTILS = "bstutils";
+
+    private BstImeHooks() {}
+
+    static boolean isArm64Guest() {
+        return android.os.Build.SUPPORTED_ABIS.length > 0
+                && android.os.Build.SUPPORTED_ABIS[0].startsWith("arm64");
+    }
+
+    static int getInt(String key, int def) {
+        try {
+            Class<?> cls = Class.forName("android.os.SystemProperties");
+            Object value = cls.getMethod("getInt", String.class, int.class)
+                    .invoke(null, key, Integer.valueOf(def));
+            return value instanceof Integer ? (Integer) value : def;
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "SystemProperties.getInt " + key, e);
+            return def;
+        }
+    }
+
+    static void set(String key, String value) {
+        try {
+            Class<?> cls = Class.forName("android.os.SystemProperties");
+            cls.getMethod("set", String.class, String.class).invoke(null, key, value);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "SystemProperties.set " + key, e);
+        }
+    }
+
+    static void setProperty(Context context, String key, String value) {
+        try {
+            Object mgr = context.getApplicationContext().getSystemService(BST_UTILS);
+            if (mgr == null) {
+                Log.w(TAG, "bstutils service missing");
+                return;
+            }
+            mgr.getClass().getMethod("setProperty", String.class, String.class)
+                    .invoke(null, key, value);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "setProperty " + key, e);
+        }
+    }
+
+    static boolean isSoftKeyboardEnabled(Context context) {
+        try {
+            Object mgr = context.getApplicationContext().getSystemService(BST_UTILS);
+            if (mgr == null) {
+                return false;
+            }
+            Object value = mgr.getClass().getMethod("isBstSoftKeyboardEnabled").invoke(mgr);
+            return Boolean.TRUE.equals(value);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "isBstSoftKeyboardEnabled", e);
+            return false;
+        }
+    }
+}
+
